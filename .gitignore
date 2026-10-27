@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.streamlit/secrets.toml
+*.pyc
+.playwright-mcp/
+.env
+tests/e2e/screenshots/*.png
