@@ -74,7 +74,7 @@ def app(page, app_url):
 def go(page, menu):
     page.locator('[data-testid="stSidebar"] [data-testid="stRadioOption"]').filter(has_text=menu).first.click()
     wait_idle(page)
-    page.wait_for_selector(f'.pmi-hero h1:has-text("{menu.split()[0]}")')
+    page.wait_for_selector(f'.pmi-hero[data-page="{menu}"]')
 
 
 def select(page, label, option):

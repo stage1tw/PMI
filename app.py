@@ -1,6 +1,7 @@
 """Procurement Market Intelligence (PMI) — 도급공사/외주용역 시장동향 AI 리포터."""
 import os
-from datetime import date
+from datetime import date, datetime
+from email.utils import parsedate_to_datetime
 
 import anthropic
 import openai
@@ -12,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()  # 로컬 .env (OPENAI_API_KEY 등) → 환경변수
 
 from pmi import analyzer, chatbot, collectors, report, storage, theme  # noqa: E402
-from pmi.config import CATEGORIES, LEVEL_ICON, MINIMUM_WAGE, SOURCES, WAGE_SAMPLE  # noqa: E402
+from pmi.config import CATEGORIES, LEVEL_ICON, LEVELS, SOURCES, WAGE_SAMPLE  # noqa: E402
 
 st.set_page_config(page_title="PMI · 외주용역 시장동향", page_icon="📊", layout="wide")
 theme.inject_css()
@@ -44,16 +45,25 @@ def show_error(prefix: str, e: Exception):
         st.code(f"{type(e).__name__}: {e}")
 
 
+_PANEL_N = [0]  # 스크립트가 재실행될 때마다 0 으로 초기화됨
+
+
+def panel():
+    """흰 카드 패널. Streamlit 1.67 은 테두리 컨테이너에 고유 testid 가 없어 key 클래스(st-key-panel_*)로 스타일링한다."""
+    _PANEL_N[0] += 1
+    return st.container(border=True, key=f"panel_{_PANEL_N[0]}")
+
+
 def chart(fig, height=360, title=None):
     fig.update_layout(height=height, title=title)
-    st.plotly_chart(fig, width="stretch", config={"displaylogo": False})
+    st.plotly_chart(fig, width="stretch", theme=None, config={"displaylogo": False})  # theme=None: pmi 템플릿(투명 배경) 사용
 
 
 # ---------- 사이드바 ----------
 with st.sidebar:
     theme.sidebar_brand()
     page = st.radio("메뉴", ["대시보드", "품목 리포트", "AI 챗봇", "시장 지표", "리포트 아카이브", "수집 현황·설정"],
-                    label_visibility="collapsed")
+                    key="menu", label_visibility="collapsed")
     st.divider()
     api_key = secret("ANTHROPIC_API_KEY")
     if not api_key:
@@ -61,6 +71,7 @@ with st.sidebar:
                                 help="입력하지 않으면 규칙 기반 리포트로 동작합니다.") or None
     theme.sidebar_status([("Claude 분석", bool(api_key)), ("AI 챗봇", bool(secret("OPENAI_API_KEY")))])
     ecos_key, g2b_key = secret("ECOS_API_KEY"), secret("DATA_GO_KR_KEY")
+    theme.sidebar_tagline()
 
 if not storage.collect_status():
     with st.spinner("최초 실행 — 시장 데이터 수집 중..."):
@@ -69,9 +80,21 @@ if not storage.collect_status():
 MACRO = collectors.macro_snapshot()
 
 
-def hero(title, *extra):
+def last_update_label():
+    """마지막 수집 시각 — 오늘이면 '오늘 09:00', 아니면 날짜."""
+    ats = [r["at"] for r in storage.collect_status() if r.get("at")]
+    if not ats:
+        return "-"
+    at = datetime.fromisoformat(max(ats))
+    return f"오늘 {at:%H:%M}" if at.date() == date.today() else f"{at:%Y.%m.%d %H:%M}"
+
+
+def hero(title, *extra, sub=""):
     data = theme.badge("샘플 데이터 포함", "warn", "⚠ ") if MACRO["is_sample"] else theme.badge("실데이터", "on", "● ")
-    theme.hero(title, [f"기준일 {date.today():%Y-%m-%d}", data, *extra])
+    theme.hero(title, [f"기준일 {date.today():%Y-%m-%d}", data, *extra], sub=sub, page=page)
+
+
+theme.topbar(last_update_label())
 
 
 def current_pressure(key):
@@ -84,60 +107,164 @@ def current_pressure(key):
 
 
 # ---------- 대시보드 ----------
-def page_dashboard():
-    hero("전사 외주용역 원가상승 압력 대시보드", "압력지수 0~100 · 높을수록 다음 입찰 시 단가 인상 압박이 큼")
+# 도급공사 / 외주용역 구분 (디자인 시안의 탭). 품목 성격에 따른 분류이며 config 에는 없다.
+GROUPS = {"도급공사": ["plant", "construction", "maintenance"],
+          "외주용역": ["ndt", "cleaning", "security", "safety", "engineering"]}
+CAT_ICON = {"ndt": "troubleshoot", "maintenance": "build", "plant": "factory", "construction": "apartment",
+            "cleaning": "cleaning_services", "security": "security", "safety": "health_and_safety", "engineering": "engineering"}
 
-    rows = []
+
+def _news_ts(n):
+    try:
+        return parsedate_to_datetime(n["published"]).replace(tzinfo=None)
+    except Exception:
+        return datetime.min
+
+
+def _issue(key, n, q):
+    return {"title": n["title"], "link": n["link"], "cat": CATEGORIES[key].name, "tag": q["level"], "color": q["color"],
+            "date": theme.fmt_date(n["published"]), "src": n.get("source") or CATEGORIES[key].name,
+            "icon": CAT_ICON.get(key, "article"), "ts": _news_ts(n)}
+
+
+def _go(target):
+    st.session_state["menu"] = target
+
+
+def page_dashboard():
+    hero("시장 인사이트로 더 스마트한 구매를", sub="AI가 분석한 도급공사 · 외주용역 시장 동향으로, 더 나은 의사결정을 지원합니다.")
+
+    rows, quants = [], {}
     for key, cat in CATEGORIES.items():
         q, r, latest = current_pressure(key)
+        quants[key] = q
         rows.append({
             "key": key, "품목": cat.name, "압력지수": q["index"], "수준": q["level"], "color": q["color"],
             "예상 인상률(%)": q["expected"],
             "분석": ("AI " if latest and latest["ai_used"] else "규칙 ") + (latest["created_at"][:10] if latest else "실시간"),
         })
-    df = pd.DataFrame(rows).sort_values("압력지수")
-    mw = collectors.yoy(MINIMUM_WAGE, max(MINIMUM_WAGE))
-    occ = [v for v in (collectors.wage_growth(o) for o in WAGE_SAMPLE) if v is not None]
-    sample = " (샘플)" if MACRO["is_sample"] else ""
-    theme.kpi_cards([
-        ("최저임금 인상률", f"{mw:+.1f}%", f"{max(MINIMUM_WAGE)}년 {MINIMUM_WAGE[max(MINIMUM_WAGE)]:,}원/시간"),
-        ("직종 노임 상승률", f"{sum(occ) / len(occ):+.1f}%", "노임단가 평균 (예시 기준표)"),
-        ("소비자물가 CPI", f"{MACRO['cpi_yoy']:+.1f}%", "전년동월 대비" + sample),
-        ("생산자물가 PPI", f"{MACRO['ppi_yoy']:+.1f}%", "전년동월 대비" + sample),
-        ("고위험 품목", f"{(df['압력지수'] >= 55).sum()} / {len(df)}", "압력지수 55 이상"),
-    ])
+    df = pd.DataFrame(rows)
+    news_by_cat = {k: storage.get_news(k, 500) for k in CATEGORIES}
+    n_news = sum(len(v) for v in news_by_cat.values())
 
-    left, right = st.columns([1.35, 1], gap="medium")
-    with left, st.container(border=True):
-        fig = go.Figure(go.Bar(
-            x=df["압력지수"], y=df["품목"], orientation="h",
-            marker=dict(color=df["color"], cornerradius=4),
-            text=[f"{LEVEL_ICON[l]} {v:.1f} {l}" for v, l in zip(df["압력지수"], df["수준"])],
-            textposition="outside", cliponaxis=False,
-            customdata=df[["예상 인상률(%)", "분석"]],
-            hovertemplate="<b>%{y}</b><br>압력지수 %{x:.1f}<br>예상 인상률 %{customdata[0]:+.2f}%<br>%{customdata[1]}<extra></extra>",
-        ))
-        for x, lbl in ((30, "보통"), (55, "높음"), (75, "매우 높음")):
-            fig.add_vline(x=x, line=dict(color="#C3C2B7", dash="dot", width=1),
-                          annotation=dict(text=lbl, font=dict(size=11, color=theme.MUTED)), annotation_position="top")
-        fig.update_xaxes(range=[0, 115], title="압력지수")
-        chart(fig, 420, "품목별 단가 인상 압력지수")
-    with right, st.container(border=True):
-        st.markdown("#### 품목 요약")
-        show = df.sort_values("압력지수", ascending=False)[["품목", "압력지수", "수준", "예상 인상률(%)"]]
-        show["수준"] = show["수준"].map(lambda l: f"{LEVEL_ICON[l]} {l}")
-        st.dataframe(show, hide_index=True, width="stretch",
-                     column_config={"품목": st.column_config.TextColumn(width=125),
-                                    "압력지수": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f", width=95),
-                                    "수준": st.column_config.TextColumn(width=72),
-                                    "예상 인상률(%)": st.column_config.NumberColumn("인상률", format="%+.2f%%", width=68)})
+    main, side = st.columns([3.1, 1.05], gap="medium")
+    with main:
+        theme.kpi_cards([
+            ("시장 위험도", f"{df['압력지수'].mean():.0f}", f"{len(df)}개 품목 평균 압력지수", "shield", "점"),
+            ("예상 원가상승률", f"{df['예상 인상률(%)'].mean():+.1f}", "다음 입찰 기준 품목 평균", "bar_chart", "%"),
+            ("주요 시장이슈", f"{n_news}", "수집된 최근 뉴스", "article", "건"),
+            ("관리 필요 품목", f"{(df['압력지수'] >= 55).sum()}", "압력지수 55 이상", "groups", "개"),
+        ], cls="four")
 
-    st.markdown("#### 이번 주 주요 이슈")
-    news = [(CATEGORIES[k].name, n) for k in CATEGORIES for n in storage.get_news(k, 2)]
-    if news:
-        theme.news_list(news[:10])
-    else:
-        st.caption("수집된 뉴스가 없습니다. '수집 현황·설정'에서 수집을 실행하세요.")
+        with panel():
+            c1, c2 = st.columns([1, 1.5], vertical_alignment="center")
+            with c1:
+                theme.panel_title("품목별 시장 위험도")
+            grp = c2.segmented_control("구분", ["전체", *GROUPS], default="전체", key="dash_grp",
+                                       label_visibility="collapsed") or "전체"
+            sub = (df if grp == "전체" else df[df["key"].isin(GROUPS[grp])]).sort_values("압력지수", ascending=False)
+            st.caption("압력지수 0~100 · 높을수록 다음 입찰 시 단가 인상 압박이 큼")
+            cl, cr = st.columns([3.4, 1], vertical_alignment="center")
+            with cl:
+                fig = go.Figure(go.Bar(
+                    x=[n.replace(" ", "<br>", 1) for n in sub["품목"]], y=sub["압력지수"],
+                    marker=dict(color=sub["color"], cornerradius=3),
+                    text=[f"{v:.1f}" for v in sub["압력지수"]], textposition="outside", cliponaxis=False,
+                    customdata=sub[["수준", "예상 인상률(%)", "분석"]],
+                    hovertemplate="<b>%{x}</b><br>압력지수 %{y:.1f} · %{customdata[0]}<br>예상 인상률 %{customdata[1]:+.2f}%"
+                                  "<br>%{customdata[2]}<extra></extra>",
+                ))
+                fig.update_yaxes(range=[0, 100], dtick=20)
+                fig.update_xaxes(tickfont=dict(size=11))
+                fig.update_layout(bargap=0.38, margin=dict(t=24, b=8, l=8, r=8))
+                chart(fig, 330)
+            with cr:
+                prev, items = 0, []
+                for upper, label, color, _msg in LEVELS:
+                    items.append((color, f"{prev}~{min(upper, 100)} {label}"))
+                    prev = upper
+                theme.legend(items)
+
+        a, b = st.columns([1.3, 1], gap="medium")
+        with a, panel():
+            theme.panel_title("최근 시장 이슈 TOP 5")
+            top = []
+            for key in df.sort_values("압력지수", ascending=False)["key"]:
+                if news_by_cat[key]:
+                    top.append(_issue(key, news_by_cat[key][0], quants[key]))
+                if len(top) == 5:
+                    break
+            if top:
+                theme.issue_table(top)
+            else:
+                st.caption("수집된 뉴스가 없습니다. '수집 현황·설정'에서 수집을 실행하세요.")
+        with b, panel():
+            theme.panel_title("이슈 카테고리 분포")
+            counts = sorted(((CATEGORIES[k].name, len(v)) for k, v in news_by_cat.items()), key=lambda x: -x[1])
+            total = sum(c for _, c in counts)
+            if total:
+                head, rest = counts[:4], sum(c for _, c in counts[4:])
+                dist = head + ([("기타", rest)] if rest else [])
+                pc1, pc2 = st.columns([1, 1], vertical_alignment="center")
+                with pc1:
+                    pie = go.Figure(go.Pie(labels=[d[0] for d in dist], values=[d[1] for d in dist], hole=0.64, sort=False,
+                                           marker=dict(colors=theme.DONUT[:len(dist)], line=dict(color="#fff", width=2)),
+                                           textinfo="none", hovertemplate="%{label} %{value}건 (%{percent})<extra></extra>"))
+                    pie.update_layout(showlegend=False, margin=dict(t=4, b=4, l=4, r=4), annotations=[
+                        dict(text=f"<b>{total}건</b>", x=0.5, y=0.54, showarrow=False, font=dict(size=22, color=theme.NAVY)),
+                        dict(text="총 이슈", x=0.5, y=0.4, showarrow=False, font=dict(size=12, color=theme.MUTED))])
+                    chart(pie, 250)
+                with pc2:
+                    theme.legend([(theme.DONUT[i], d[0], f"{d[1] / total:.0%}") for i, d in enumerate(dist)], round_=True)
+            else:
+                st.caption("수집된 뉴스가 없습니다.")
+
+    with side:
+        latest_news = sorted((_issue(k, n, quants[k]) for k in CATEGORIES for n in news_by_cat[k][:3]),
+                             key=lambda i: i["ts"], reverse=True)
+        picked, seen = [], set()
+        for i in latest_news:  # 품목이 한쪽으로 쏠리지 않게 품목당 1건
+            if i["cat"] not in seen:
+                seen.add(i["cat"])
+                picked.append(i)
+            if len(picked) == 5:
+                break
+        theme.news_cards("오늘의 주요 뉴스", picked)
+
+        with panel():
+            theme.panel_title("주요 지표 동향 (최근 6년)")
+            t1, t2, t3 = st.tabs(["최저임금", "CPI", "PPI"])
+            with t1:
+                mw = [r for r in collectors.minimum_wage_table() if r["yoy"] is not None][-6:]
+                fig = go.Figure(go.Scatter(
+                    x=[str(r["year"]) for r in mw], y=[r["yoy"] for r in mw], mode="lines+markers+text",
+                    text=[f"{r['yoy']:.1f}" for r in mw], textposition="top center",
+                    line=dict(color=theme.ACCENT, width=2), marker=dict(size=7, color=theme.ACCENT),
+                    hovertemplate="%{x}년 전년 대비 %{y:+.1f}%<extra></extra>"))
+                fig.update_yaxes(title="(단위: %)", range=[0, max(r["yoy"] for r in mw) * 1.3])
+                fig.update_layout(margin=dict(t=12, b=8, l=8, r=8))
+                chart(fig, 230)
+            for tab, k, label in ((t2, "cpi", "소비자물가지수"), (t3, "ppi", "생산자물가지수")):
+                with tab:
+                    s = storage.get_indicator_series(k)
+                    if len(s) >= 2:
+                        d = pd.DataFrame(s).tail(24)
+                        fig = go.Figure(go.Scatter(x=d["period"], y=d["value"], mode="lines+markers",
+                                                   line=dict(color=theme.ACCENT, width=2), marker=dict(size=5),
+                                                   hovertemplate="%{x}: %{y:.2f}<extra></extra>"))
+                        fig.update_layout(margin=dict(t=12, b=8, l=8, r=8), hovermode="x")
+                        chart(fig, 230)
+                    else:
+                        st.caption(f"{label}: ECOS_API_KEY를 설정하면 시계열이 표시됩니다. "
+                                   f"현재는 샘플 {MACRO[k + '_yoy']:+.1f}% (전년동월 대비)를 사용합니다.")
+
+    q1, q2, q3 = st.columns(3, gap="small")
+    q1.button("**AI 리포트 생성**  \n품목별 시장 분석 리포트를 자동으로 생성합니다.", key="qa_report", icon=":material/description:",
+              on_click=_go, args=("품목 리포트",), width="stretch")
+    q2.button("**시장동향 분석**  \n최저임금·노임·물가 지표와 추이를 확인하세요.", key="qa_market", icon=":material/monitoring:",
+              on_click=_go, args=("시장 지표",), width="stretch")
+    q3.button("**구매 영향 분석**  \nAI에게 구매 전략과 리스크를 질문하세요.", key="qa_chat", icon=":material/smart_toy:",
+              on_click=_go, args=("AI 챗봇",), width="stretch")
 
 
 # ---------- 품목 리포트 ----------
@@ -148,7 +275,7 @@ def render_report(payload, md_text, cat_name):
         theme.summary_card(q, r, LEVEL_ICON[q["level"]])
         st.markdown(f'<div class="pmi-headline">{theme.esc(r["headline"])}</div>', unsafe_allow_html=True)
         st.caption(r["adjustment_reason"])
-    with b, st.container(border=True):
+    with b, panel():
         names = {"labor": "노무비", "material": "자재비", "expense": "경비"}
         wf = go.Figure(go.Waterfall(
             x=[names[k] for k in names] + ["AI 조정", "예상"],
@@ -272,12 +399,12 @@ def page_indicators():
     hero("시장 지표")
     mw = pd.DataFrame(collectors.minimum_wage_table())
     a, b = st.columns(2, gap="medium")
-    with a, st.container(border=True):
+    with a, panel():
         fig = go.Figure(go.Bar(x=mw["year"].astype(str), y=mw["wage"], marker=dict(color=theme.ACCENT, cornerradius=4),
                                customdata=mw["yoy"], hovertemplate="%{x}년 %{y:,}원<br>전년 대비 %{customdata:+.1f}%<extra></extra>"))
         fig.update_yaxes(tickformat=",")
         chart(fig, 360, "최저임금 (원/시간) — 고용노동부 고시")
-    with b, st.container(border=True):
+    with b, panel():
         g = pd.DataFrame([{"직종": o, "상승률": collectors.wage_growth(o)} for o in WAGE_SAMPLE]).sort_values("상승률")
         fig = go.Figure(go.Bar(x=g["상승률"], y=g["직종"], orientation="h", marker=dict(color=theme.ACCENT, cornerradius=4),
                                text=g["상승률"].map(lambda v: f"{v:+.1f}%"), textposition="outside", cliponaxis=False,
@@ -293,7 +420,7 @@ def page_indicators():
         s = storage.get_indicator_series(key)
         if s:
             d = pd.DataFrame(s)
-            with st.container(border=True):
+            with panel():
                 fig = go.Figure(go.Scatter(x=d["period"], y=d["value"], mode="lines", line=dict(color=theme.ACCENT, width=2),
                                            hovertemplate="%{x}: %{y:.2f}<extra></extra>"))
                 fig.update_layout(hovermode="x")
@@ -333,7 +460,7 @@ def page_archive():
             ("직전 대비", "-" if pd.isna(last["변화"]) else f"{last['변화']:+.1f}p",
              "비교할 이전 리포트 없음" if pd.isna(last["변화"]) else f"이전 {hist.iloc[-2]['created_at'][:10]}"),
         ])
-    with c2, st.container(border=True):
+    with c2, panel():
         fig = go.Figure(go.Scatter(x=hist["created_at"], y=hist["pressure_index"], mode="lines+markers",
                                    line=dict(color=theme.ACCENT, width=2), marker=dict(size=8),
                                    customdata=hist["주차"], hovertemplate="%{customdata}<br>압력지수 %{y:.1f}<extra></extra>"))
@@ -347,7 +474,7 @@ def page_archive():
     st.markdown("#### 리포트 보기")
     rid = st.selectbox("리포트 열기", df["id"], format_func=lambda i: f"#{i} {df.set_index('id').loc[i, '품목']} ({df.set_index('id').loc[i, 'created_at']})")
     rep = storage.get_report(int(rid))
-    with st.container(border=True):
+    with panel():
         st.markdown(rep["markdown"])
     st.download_button("⬇ HTML", report.to_html(rep["markdown"], f"PMI_report_{rid}"), f"PMI_report_{rid}.html", "text/html")
 

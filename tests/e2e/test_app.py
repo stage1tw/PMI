@@ -23,14 +23,18 @@ def test_starts_without_keys_and_flags_sample_data(app):
 # 2. 대시보드 · F4-1, 수용기준 1
 def test_dashboard_kpis_and_all_categories(app):
     kpis = app.locator(".pmi-kpi")
-    assert kpis.count() == 5
-    for i in range(5):  # 값 잘림(…) 없음
+    assert kpis.count() == 4  # 시장 위험도 · 예상 원가상승률 · 주요 시장이슈 · 관리 필요 품목
+    for i in range(4):  # 값 잘림(…) 없음
         assert kpis.nth(i).locator(".value").evaluate("e => e.scrollWidth <= e.clientWidth")
-    expect(app.locator(".js-plotly-plot")).to_have_count(1)
+    # 막대(품목별 위험도) + 도넛(이슈 분포) + 최저임금 추이선 (키 없으면 CPI/PPI 탭은 안내 문구)
+    expect(app.locator(".js-plotly-plot")).to_have_count(3)
     chart = app.locator(".js-plotly-plot").first.inner_text()
+    flat = "".join(chart.split())  # 품목명이 두 줄로 접혀 표시되므로 공백·줄바꿈 제거 후 비교
     for cat in CATEGORIES.values():
-        assert cat.name in chart, f"{cat.name} 압력지수 막대 누락"
-    assert app.locator('[data-testid="stDataFrame"]').count() == 1
+        assert "".join(cat.name.split()) in flat, f"{cat.name} 압력지수 막대 누락"
+    assert app.locator('[data-testid="stDataFrame"]').count() == 0  # TOP 5 는 HTML 표
+    assert app.locator(".pmi-table tbody tr").count() <= 5
+    assert app.locator(".pmi-hero .pmi-badge", has_text="샘플 데이터 포함").count() == 1
 
 
 # 3. 품목 리포트 · F3, F4-2, 수용기준 1 (8개 품목 각각)
@@ -121,7 +125,7 @@ def test_invalid_anthropic_key_shows_error_without_crash(app):
     assert app.locator('[data-testid="stAlertContentError"]').count() >= 1
     assert app.locator('[data-testid="stException"]').count() == 0
     go(app, "대시보드")  # 이후에도 앱이 정상 동작
-    assert app.locator(".pmi-kpi").count() == 5
+    assert app.locator(".pmi-kpi").count() == 4
 
 
 # 10. 반응형 — 가로 스크롤·텍스트 잘림 없음

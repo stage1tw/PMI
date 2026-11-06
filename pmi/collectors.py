@@ -102,6 +102,13 @@ def fetch_g2b(api_key: str, keyword: str, days: int = 60):
         "type": "json",
     }
     data = requests.get(G2B_URL, params=params, timeout=TIMEOUT).json()
+    # 오류 응답을 빈 결과로 삼키면 collect_log 에 "성공 0건"으로 남으므로 예외로 올린다.
+    err = data.get("OpenAPI_ServiceResponse", {}).get("cmmMsgHeader")
+    if err:
+        raise RuntimeError(f"{err.get('errMsg')} (code {err.get('returnReasonCode')})")
+    header = data.get("response", {}).get("header", {})
+    if header.get("resultCode", "00") != "00":
+        raise RuntimeError(f"{header.get('resultMsg')} (code {header.get('resultCode')})")
     items = data.get("response", {}).get("body", {}).get("items") or []
     return [
         {
